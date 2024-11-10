@@ -1,0 +1,98 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.metrics import f1_score
+from sklearn.decomposition import PCA
+from imblearn.over_sampling import SMOTE
+from xgboost import XGBClassifier
+from optuna import create_study
+from sklearn.linear_model import LogisticRegression
+
+# Load the data
+train_data = pd.read_csv('train.csv')
+test_data = pd.read_csv('test.csv')
+
+# Separate features and target variable
+X = train_data.drop(['UID', 'Target'], axis=1)
+y = train_data['Target']
+
+# Encode target labels
+label_encoder = LabelEncoder()
+y_encoded = label_encoder.fit_transform(y)
+
+# Identify numerical columns
+numerical_cols = X.select_dtypes(include=['float64', 'int64']).columns
+
+# Handle missing values for numerical columns
+numerical_imputer = SimpleImputer(strategy='median')
+X[numerical_cols] = numerical_imputer.fit_transform(X[numerical_cols])
+
+# Feature Scaling
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Dimensionality Reduction
+pca = PCA(n_components=0.95)
+X_pca = pca.fit_transform(X_scaled)
+
+# Stratified Train-Test Split for Validation
+X_train, X_val, y_train, y_val = train_test_split(X_pca, y_encoded, stratify=y_encoded, test_size=0.2, random_state=42)
+
+# Handle Class Imbalance
+smote = SMOTE(random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+# Optuna Hyperparameter tuning with reduced trials and cross-validation folds
+def objective(trial):
+    params = {
+        'objective': 'multi:softmax',
+        'num_class': 3,
+        'learning_rate': trial.suggest_loguniform('learning_rate', 0.01, 0.1),
+        'max_depth': trial.suggest_int('max_depth', 3, 8),
+        'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.6, 1.0),
+        'subsample': trial.suggest_uniform('subsample', 0.6, 1.0),
+        'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+        'reg_alpha': trial.suggest_loguniform('reg_alpha', 1e-8, 1.0),
+        'reg_lambda': trial.suggest_loguniform('reg_lambda', 1e-8, 1.0)
+    }
+    model = XGBClassifier(**params)
+    model.fit(X_train_res, y_train_res)
+    y_pred = model.predict(X_val)
+    return f1_score(y_val, y_pred, average='macro')
+
+# Run Optuna for 10-20 trials to reduce runtime
+study = create_study(direction='maximize')
+study.optimize(objective, n_trials=40)
+xgb_best_params = study.best_params
+
+# Simplified Ensemble Model with only XGBoost and RandomForest
+xgb_model = XGBClassifier(**xgb_best_params)
+rf_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, class_weight='balanced')
+
+stacked_model = StackingClassifier(
+    estimators=[('xgb', xgb_model), ('rf', rf_model)],
+    final_estimator=LogisticRegression(max_iter=500),
+    cv=3,
+    n_jobs=-1
+)
+stacked_model.fit(X_train_res, y_train_res)
+
+# Evaluate the model
+y_val_pred = stacked_model.predict(X_val)
+macro_f1 = f1_score(y_val, y_val_pred, average='macro')
+print(f'Macro F1-score on Validation Set: {macro_f1}')
+
+# Preprocess the test data and make predictions
+test_data_cleaned = test_data[numerical_cols]
+test_data_cleaned = numerical_imputer.transform(test_data_cleaned)
+X_test_scaled = scaler.transform(test_data_cleaned)
+X_test_pca = pca.transform(X_test_scaled)
+
+# Predictions on the test data
+y_test_pred_final = stacked_model.predict(X_test_pca)
+submission = pd.DataFrame({'UID': test_data['UID'], 'Target': label_encoder.inverse_transform(y_test_pred_final)})
+submission.to_csv('submission2.csv', index=False)
+print("Submission file 'submission2.csv' has been created.")
